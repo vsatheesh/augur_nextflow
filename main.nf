@@ -13,12 +13,17 @@ params.input_metadata = "data/metadata.tsv"
 
 params.reference = "config/zika_outgroup.gb"
 
+params.colors = file("config/colors.tsv")
+params.lat_longs = file("config/lat_longs.tsv")
+params.auspice_config = file("config/auspice_config.json")
+
+
 params.coalescent = "opt"
 params.date_inference = "marginal"
 params.clock_filter_iqd = 4
 
 params.inference_method = "joint"
-
+params.columns = "region country"
 
 process index_sequences {
     tag "index_sequences"
@@ -117,8 +122,7 @@ process refine_tree {
     val clock_filter_iqd
 
     output:
-    path "tree_refined.nwk"
-    path "branch_lengths.json"
+    tuple path("tree_refined.nwk"), path("branch_lengths.json")
 
     script:
     """
@@ -156,6 +160,74 @@ process ancestral_sequences {
     """
 }
 
+process translate {
+    tag "translate"
+    publishDir "${params.outdir}/translated_sequences", mode: 'copy'
+
+    input:
+    tuple path(tree), path(node_data), path(reference)
+
+    output:
+    path "aa_muts.json"
+
+    script:
+    """
+    augur translate \
+        --tree $tree \
+        --ancestral-sequences $node_data \
+        --reference-sequence $reference \
+        --output-node-data aa_muts.json
+    """
+}
+
+process traits {
+    tag "traits"
+    publishDir "${params.outdir}/traits", mode: 'copy'
+
+    input:
+        tuple val(columns), path(tree), path(metadata)
+
+    output:
+        tuple path("traits.json"), path("traitsregion.mugration_model.txt"), path("traitscountry.mugration_model.txt")
+
+    script:
+    """
+    augur traits \
+        --tree ${tree} \
+        --metadata ${metadata} \
+        --output-node-data traits.json \
+        --columns ${columns} \
+        --confidence
+    """
+}
+
+process export {
+    tag "export"
+    publishDir "${params.outdir}/export", mode: 'copy'
+
+    input:
+        tuple path(tree), path(metadata), path(branch_lengths), path(traits), path(nt_muts), path(aa_muts), path(colors), \
+            path(lat_longs), path(auspice_config)
+
+    output:
+        path("auspice_json.json")
+
+    log.info "Exporting data files for auspice..."
+
+    script:
+        """
+        augur export v2 \
+            --tree ${tree} \
+            --metadata ${metadata} \
+            --node-data ${branch_lengths} ${traits} ${nt_muts} ${aa_muts} \
+            --colors ${colors} \
+            --lat-longs ${lat_longs} \
+            --auspice-config ${auspice_config} \
+            --include-root-sequence \
+            --output auspice_json.json
+        """
+}
+
 
 Channel.fromPath(params.input_fasta, checkIfExists:true)
     .set{ input_fasta_ch }
@@ -169,16 +241,18 @@ Channel.fromPath(params.reference, checkIfExists:true)
 Channel
     .value(params.inference_method)
     .set{ inference_method_ch }
-
-
-/*workflow {
-    index_sequences(input_fasta_ch)
-    filter_sequences(input_fasta_ch, index_sequences.out, input_metadata_ch, dropped_strains_ch)
-    align_sequences(filter_sequences.out, reference_ch)
-    align_sequences_ch(filtered_sequences_ch)
-        .set{ alignment_ch }
-    build_tree(alignment_ch)
-}*/
+Channel
+    .value(params.columns)
+    .set{ columns_ch }
+Channel
+    .value(params.colors)
+    .set{ colors_ch }
+Channel
+    .value(params.lat_longs)
+    .set { lat_longs_ch }
+Channel 
+    .value(params.auspice_config)
+    .set { auspice_config_ch }
 
 workflow {
     index_sequences(input_fasta_ch)
@@ -189,6 +263,7 @@ workflow {
 
     align_sequences(filtered_sequences_ch, reference_ch)
         .set{ alignment_ch }
+ //   alignment_ch |view
 
     build_tree(alignment_ch)
         .set{ tree_ch }
@@ -196,12 +271,41 @@ workflow {
     refine_tree(tree_ch, alignment_ch, input_metadata_ch, params.coalescent, params.date_inference, params.clock_filter_iqd)
         .set{ refined_tree_ch }
 
-    ancestral_sequences_ch = Channel
-        .from(refined_tree_ch)
-        .cross(alignment_ch)
-        .map { tree, alignment -> tuple(tree, alignment) }
-        .map { items -> tuple(params.inference_method, items[0], items[1]) }
+    ancestral_sequences_ch = refined_tree_ch
+        |combine(alignment_ch)
+        |view()
+        |map { arr -> tuple(params.inference_method, arr[0], arr[2]) }
+        |ancestral_sequences
+ 
+//    ancestral_sequences_ch |view 
 
-    ancestral_sequences(ancestral_sequences_ch)
+//    ancestral_sequences(ancestral_sequences_ch)
+
+    tree_ch_from_refined_tree = refined_tree_ch.map { it[0] }
+    branch_ch_from_refined_tree = refined_tree_ch.map { it[1] }
+
+    translate_ch = tree_ch_from_refined_tree
+        |combine(ancestral_sequences.out)
+        |combine(reference_ch)
+        |translate
+
+    traits_ch = tree_ch_from_refined_tree
+        | combine(input_metadata_ch)
+        | map { arr -> tuple(params.columns, arr[0], arr[1]) }
+        | traits
+    
+    traits_ch.view()
+    traits_from_traits_ch = traits_ch.map { it[0] }
+
+    export_ch = tree_ch_from_refined_tree
+        | combine(input_metadata_ch)
+        | combine(branch_ch_from_refined_tree)
+        | combine(traits_from_traits_ch)
+        | combine(ancestral_sequences.out)
+        | combine(translate.out)
+        | combine(colors_ch)
+        | combine(lat_longs_ch)
+        | combine(auspice_config_ch)
+        |export
 }
 
